@@ -6,7 +6,7 @@
 
 ### Using `create-next-app`
 
-Download [`create-next-app`](https://github.com/segmentio/create-next-app) to bootstrap the example:
+Execute [`create-next-app`](https://github.com/segmentio/create-next-app) with [Yarn](https://yarnpkg.com/lang/en/docs/cli/create/) or [npx](https://github.com/zkat/npx#readme) to bootstrap the example:
 
 ```bash
 npx create-next-app --example with-redux-reselect-recompose with-redux-reselect-recompose-app
@@ -28,6 +28,9 @@ Install it and run:
 ```bash
 npm install
 npm run dev
+# or
+yarn
+yarn dev
 ```
 
 OR
@@ -45,4 +48,4 @@ now
 ```
 
 ## The idea behind the example
-This example is based on the great work of [with-redux](https://github.com/zeit/next.js/tree/v3-beta/examples/with-redux) example with the addition of [reselect](https://github.com/reactjs/reselect) and [recompose](https://github.com/acdlite/recompose)
+This example is based on the great work of [with-redux](https://github.com/zeit/next.js/blob/master/examples/with-redux/) example with the addition of [reselect](https://github.com/reactjs/reselect) and [recompose](https://github.com/acdlite/recompose)
