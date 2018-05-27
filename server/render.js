@@ -9,10 +9,12 @@ import { Router } from '../lib/router'
 import { loadGetInitialProps, isResSent } from '../lib/utils'
 import { getAvailableChunks } from './utils'
 import Head, { defaultHead } from '../lib/head'
-import App from '../lib/app'
 import ErrorDebug from '../lib/error-debug'
 import { flushChunks } from '../lib/dynamic'
-import xssFilters from 'xss-filters'
+import { BUILD_MANIFEST } from '../lib/constants'
+import { applySourcemaps } from './lib/source-map-support'
+
+const logger = console
 
 export async function render (req, res, pathname, query, opts) {
   const html = await renderToHTML(req, res, pathname, query, opts)
@@ -36,9 +38,9 @@ async function doRender (req, res, pathname, query, {
   err,
   page,
   buildId,
-  buildStats,
   hotReloader,
   assetPrefix,
+  runtimeConfig,
   availableChunks,
   dist,
   dir = process.cwd(),
@@ -48,19 +50,33 @@ async function doRender (req, res, pathname, query, {
 } = {}) {
   page = page || pathname
 
+  await applySourcemaps(err)
+
   if (hotReloader) { // In dev mode we use on demand entries to compile the page before rendering
     await ensurePage(page, { dir, hotReloader })
   }
 
   const documentPath = join(dir, dist, 'dist', 'bundles', 'pages', '_document')
+  const appPath = join(dir, dist, 'dist', 'bundles', 'pages', '_app')
+  const buildManifest = require(join(dir, dist, BUILD_MANIFEST))
+  let [Component, Document, App] = await Promise.all([
+    requirePage(page, {dir, dist}),
+    require(documentPath),
+    require(appPath)
+  ])
 
-  let Component = requirePage(page, {dir, dist})
-  let Document = require(documentPath)
   Component = Component.default || Component
+
+  if (typeof Component !== 'function') {
+    throw new Error(`The default export is not a React Component in page: "${pathname}"`)
+  }
+
+  App = App.default || App
   Document = Document.default || Document
   const asPath = req.url
   const ctx = { err, req, res, pathname, query, asPath }
-  const props = await loadGetInitialProps(Component, ctx)
+  const router = new Router(pathname, query, asPath)
+  const props = await loadGetInitialProps(App, {Component, router, ctx})
 
   // the response might be finshed on the getinitialprops call
   if (isResSent(res)) return
@@ -68,8 +84,8 @@ async function doRender (req, res, pathname, query, {
   const renderPage = (enhancer = Page => Page) => {
     const app = createElement(App, {
       Component: enhancer(Component),
-      props,
-      router: new Router(pathname, query, asPath)
+      router,
+      ...props
     })
 
     const render = staticMarkup ? renderToStaticMarkup : renderToString
@@ -82,7 +98,7 @@ async function doRender (req, res, pathname, query, {
       if (err && dev) {
         errorHtml = render(createElement(ErrorDebug, { error: err }))
       } else if (err) {
-        errorHtml = render(app)
+        html = render(app)
       } else {
         html = render(app)
       }
@@ -91,7 +107,7 @@ async function doRender (req, res, pathname, query, {
     }
     const chunks = loadChunks({ dev, dir, dist, availableChunks })
 
-    return { html, head, errorHtml, chunks }
+    return { html, head, errorHtml, chunks, buildManifest }
   }
 
   const docProps = await loadGetInitialProps(Document, { ...ctx, renderPage })
@@ -106,55 +122,39 @@ async function doRender (req, res, pathname, query, {
       pathname, // the requested path
       query,
       buildId,
-      buildStats,
       assetPrefix,
+      runtimeConfig,
       nextExport,
       err: (err) ? serializeError(dev, err) : null
     },
     dev,
     dir,
     staticMarkup,
+    buildManifest,
     ...docProps
   })
 
   return '<!DOCTYPE html>' + renderToStaticMarkup(doc)
 }
 
-export async function renderScriptError (req, res, page, error, customFields, { dev }) {
+export async function renderScriptError (req, res, page, error) {
   // Asks CDNs and others to not to cache the errored page
-  res.setHeader('Cache-Control', 'no-store, must-revalidate')
-  // prevent XSS attacks by filtering the page before printing it.
-  page = xssFilters.uriInSingleQuotedAttr(page)
-  res.setHeader('Content-Type', 'text/javascript')
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate')
 
-  if (error.code === 'ENOENT') {
-    res.end(`
-      window.__NEXT_REGISTER_PAGE('${page}', function() {
-        var error = new Error('Page does not exist: ${page}')
-        error.statusCode = 404
-
-        return { error: error }
-      })
-    `)
+  if (error.code === 'ENOENT' || error.message === 'INVALID_BUILD_ID') {
+    res.statusCode = 404
+    res.end('404 - Not Found')
     return
   }
 
-  const errorJson = {
-    ...serializeError(dev, error),
-    ...customFields
-  }
-
-  res.end(`
-    window.__NEXT_REGISTER_PAGE('${page}', function() {
-      var error = ${JSON.stringify(errorJson)}
-      return { error: error }
-    })
-  `)
+  logger.error(error.stack)
+  res.statusCode = 500
+  res.end('500 - Internal Error')
 }
 
-export function sendHTML (req, res, html, method, { dev }) {
+export function sendHTML (req, res, html, method, { dev, generateEtags }) {
   if (isResSent(res)) return
-  const etag = generateETag(html)
+  const etag = generateEtags && generateETag(html)
 
   if (fresh(req.headers, { etag })) {
     res.statusCode = 304
@@ -168,7 +168,10 @@ export function sendHTML (req, res, html, method, { dev }) {
     res.setHeader('Cache-Control', 'no-store, must-revalidate')
   }
 
-  res.setHeader('ETag', etag)
+  if (etag) {
+    res.setHeader('ETag', etag)
+  }
+
   if (!res.getHeader('Content-Type')) {
     res.setHeader('Content-Type', 'text/html; charset=utf-8')
   }
@@ -209,15 +212,15 @@ function serializeError (dev, err) {
 export function serveStatic (req, res, path) {
   return new Promise((resolve, reject) => {
     send(req, path)
-    .on('directory', () => {
+      .on('directory', () => {
       // We don't allow directories to be read.
-      const err = new Error('No directory access')
-      err.code = 'ENOENT'
-      reject(err)
-    })
-    .on('error', reject)
-    .pipe(res)
-    .on('finish', resolve)
+        const err = new Error('No directory access')
+        err.code = 'ENOENT'
+        reject(err)
+      })
+      .on('error', reject)
+      .pipe(res)
+      .on('finish', resolve)
   })
 }
 
